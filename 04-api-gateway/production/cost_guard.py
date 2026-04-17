@@ -8,10 +8,18 @@ Mục tiêu: Tránh bill bất ngờ từ LLM API.
 
 Trong production: lưu trong Redis/DB, không phải in-memory.
 """
+import os
 import time
 import logging
 from dataclasses import dataclass, field
 from fastapi import HTTPException
+
+try:
+    import redis
+    REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+    r = redis.from_url(REDIS_URL, decode_responses=True)
+except ImportError:
+    r = None
 
 logger = logging.getLogger(__name__)
 
@@ -46,27 +54,59 @@ class CostGuard:
         self.daily_budget_usd = daily_budget_usd
         self.global_daily_budget_usd = global_daily_budget_usd
         self.warn_at_pct = warn_at_pct
-        self._records: dict[str, UsageRecord] = {}
+        self._records: dict[str, UsageRecord] = {}  # Fallback in-memory
         self._global_today = time.strftime("%Y-%m-%d")
         self._global_cost = 0.0
 
+    def _get_redis_key(self, user_id: str, stat_type: str, today: str) -> str:
+        return f"cg:{stat_type}:{user_id}:{today}"
+
+    def _get_global_key(self, today: str) -> str:
+        return f"cg:global_cost:{today}"
+
     def _get_record(self, user_id: str) -> UsageRecord:
         today = time.strftime("%Y-%m-%d")
-        record = self._records.get(user_id)
-        if not record or record.day != today:
-            self._records[user_id] = UsageRecord(user_id=user_id, day=today)
-        return self._records[user_id]
+        if not r:
+            record = self._records.get(user_id)
+            if not record or record.day != today:
+                self._records[user_id] = UsageRecord(user_id=user_id, day=today)
+            return self._records[user_id]
+
+        pipe = r.pipeline()
+        pipe.get(self._get_redis_key(user_id, "input", today))
+        pipe.get(self._get_redis_key(user_id, "output", today))
+        pipe.get(self._get_redis_key(user_id, "reqs", today))
+        res = pipe.execute()
+
+        return UsageRecord(
+            user_id=user_id,
+            input_tokens=int(res[0] or 0),
+            output_tokens=int(res[1] or 0),
+            request_count=int(res[2] or 0),
+            day=today
+        )
+
+    def _get_global_cost(self, today: str) -> float:
+        if not r:
+            if self._global_today != today:
+                self._global_today = today
+                self._global_cost = 0.0
+            return self._global_cost
+        val = r.get(self._get_global_key(today))
+        return float(val or 0.0)
 
     def check_budget(self, user_id: str) -> None:
         """
         Kiểm tra budget trước khi gọi LLM.
         Raise 402 nếu vượt budget.
         """
+        today = time.strftime("%Y-%m-%d")
         record = self._get_record(user_id)
+        global_cost = self._get_global_cost(today)
 
         # Global budget check
-        if self._global_cost >= self.global_daily_budget_usd:
-            logger.critical(f"GLOBAL BUDGET EXCEEDED: ${self._global_cost:.4f}")
+        if global_cost >= self.global_daily_budget_usd:
+            logger.critical(f"GLOBAL BUDGET EXCEEDED: ${global_cost:.4f}")
             raise HTTPException(
                 status_code=503,
                 detail="Service temporarily unavailable due to budget limits. Try again tomorrow.",
@@ -94,15 +134,41 @@ class CostGuard:
         self, user_id: str, input_tokens: int, output_tokens: int
     ) -> UsageRecord:
         """Ghi nhận usage sau khi gọi LLM xong."""
-        record = self._get_record(user_id)
-        record.input_tokens += input_tokens
-        record.output_tokens += output_tokens
-        record.request_count += 1
-
+        today = time.strftime("%Y-%m-%d")
         cost = (input_tokens / 1000 * PRICE_PER_1K_INPUT_TOKENS +
                 output_tokens / 1000 * PRICE_PER_1K_OUTPUT_TOKENS)
-        self._global_cost += cost
 
+        if not r:
+            record = self._get_record(user_id)
+            record.input_tokens += input_tokens
+            record.output_tokens += output_tokens
+            record.request_count += 1
+            if self._global_today != today:
+                self._global_today = today
+                self._global_cost = 0.0
+            self._global_cost += cost
+        else:
+            pipe = r.pipeline()
+            k_in = self._get_redis_key(user_id, "input", today)
+            k_out = self._get_redis_key(user_id, "output", today)
+            k_reqs = self._get_redis_key(user_id, "reqs", today)
+            k_glob = self._get_global_key(today)
+            
+            pipe.incrby(k_in, input_tokens)
+            pipe.incrby(k_out, output_tokens)
+            pipe.incr(k_reqs)
+            pipe.incrbyfloat(k_glob, cost)
+            
+            # Thời gian lưu trữ Redis keys (32 days ~ 1 month context)
+            ttl = 32 * 24 * 3600
+            pipe.expire(k_in, ttl)
+            pipe.expire(k_out, ttl)
+            pipe.expire(k_reqs, ttl)
+            pipe.expire(k_glob, ttl)
+            
+            pipe.execute()
+
+        record = self._get_record(user_id)
         logger.info(
             f"Usage: user={user_id} req={record.request_count} "
             f"cost=${record.total_cost_usd:.4f}/{self.daily_budget_usd}"

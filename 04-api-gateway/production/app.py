@@ -80,8 +80,9 @@ async def security_headers(request: Request, call_next):
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["X-XSS-Protection"] = "1; mode=block"
     response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
-    # Ẩn server info
-    response.headers.pop("server", None)
+    # Ẩn server info (sửa lỗi AttributeError trên bản Starlette mới)
+    if "server" in response.headers:
+        response.headers["server"]
     return response
 
 
@@ -165,8 +166,6 @@ async def ask_agent(
 def my_usage(user: dict = Depends(verify_token)):
     """Xem usage của bản thân."""
     return cost_guard.get_usage(user["username"])
-
-
 @app.get("/admin/stats")
 def admin_stats(user: dict = Depends(verify_token)):
     """Admin only: xem tổng stats."""
@@ -185,10 +184,21 @@ def admin_stats(user: dict = Depends(verify_token)):
 
 @app.get("/health")
 def health():
+    redis_status = "N/A"
+    try:
+        from rate_limiter import r as redis_client
+        if redis_client and redis_client.ping():
+            redis_status = "connected"
+        else:
+            redis_status = "disconnected"
+    except Exception:
+        redis_status = "error"
+
     return {
-        "status": "ok",
+        "status": "ok" if redis_status in ("connected", "N/A") else "degraded",
         "uptime_seconds": round(time.time() - START_TIME, 1),
         "security": "JWT + RateLimit + CostGuard",
+        "redis": redis_status,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 

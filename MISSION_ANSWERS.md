@@ -39,6 +39,34 @@ image size :
 - URL: https://day12-production-960d.up.railway.app
 - Screenshot: ../03-cloud-deployment/railway/evidence.png 
 
+## Part 4: API Security
 
+### Exercise 4.1-4.3: Test results
+4.1: missing api key , bad hostname 
+4.2: valid api key, valid hostname
+4.3: valid api key, valid hostname, rate limit exceeded
 
+### Exercise 4.4: Cost guard
+- Quản lý chi phí bằng Redis thay vì RAM (in-memory).
+- Gọi `redis.pipeline()` để tăng (incr) token usage và thiết lập thời hạn lưu trữ (TTL) nhằm giới hạn request (dùng HTTPException 402 nếu vượt `DAILY_BUDGET_USD`).
 
+## Part 5: Scaling & Reliability
+
+### Exercise 5.1: Health checks
+- `/health`: Liveness probe (kiểm tra `redis.ping()` và tình trạng RAM/CPU) để Cloud platform xem máy chủ còn sống không.
+- `/ready`: Readiness probe, phản hồi cho Load Balancer biết instance này đã load xong model và sẵn sàng nhận traffic.
+
+### Exercise 5.2: Graceful shutdown
+- Bắt signal `SIGTERM` bằng thư viện signal để chặn request mới.
+- Chờ các requests đang handle (in-flight) hoàn thiện trước khi đóng gắt kết nối.
+
+### Exercise 5.3: Stateless design
+- Mọi dữ liệu phiên (session), rate limit, cost tracking đều được lưu về backend tập trung là Redis. Bất kỳ node Agent nào cũng có thể xử lý tiếp mà không sợ mất state cục bộ.
+
+### Exercise 5.4: Load balancing
+- Sử dụng `Nginx` đóng vai trò upstream, phân tán HTTP request đồng đều tới nhiều instance (ví dụ `replicas: 3`) đã lưu trong `docker-compose.yml`.
+
+## Part 6: Final Project
+- Hoàn thiện `my-production-agent`:
+  - Image sử dụng Multi-stage builds, non-root user và tự động Healthcheck.
+  - Setup `.env.example`, `.dockerignore`, file CI/CD `render.yaml`.
