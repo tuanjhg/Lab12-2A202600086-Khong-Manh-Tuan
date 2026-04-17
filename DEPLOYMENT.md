@@ -3,6 +3,8 @@
 ## Public URL
 https://day12-production-960d.up.railway.app
 
+https://focused-learning-production-ff4b.up.railway.app
+
 ## Platform
 Railway
 
